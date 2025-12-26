@@ -6,13 +6,14 @@ import {
   generalSettingsStore,
   llmProviderStore,
   analyticsSettingsStore,
+  conigmaConnectionStore,
 } from '@extension/storage';
 import { t } from '@extension/i18n';
 import BrowserContext from './browser/context';
 import { Executor } from './agent/executor';
 import { createLogger } from './log';
 import { ExecutionState } from './agent/event/types';
-import { createChatModel } from './agent/helper';
+import { createChatModel, initConigmaTokenCache } from './agent/helper';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { DEFAULT_AGENT_OPTIONS } from './agent/types';
 import { SpeechToTextService } from './services/speechToText';
@@ -57,6 +58,11 @@ logger.info('background loaded');
 // Initialize analytics
 analytics.init().catch(error => {
   logger.error('Failed to initialize analytics:', error);
+});
+
+// Initialize Conigma token cache for LLM proxy
+initConigmaTokenCache().catch(error => {
+  logger.info('Conigma not connected (this is normal if not configured):', error?.message);
 });
 
 // Listen for analytics settings changes
@@ -287,6 +293,10 @@ async function setupExecutor(taskId: string, task: string, browserContext: Brows
   if (!navigatorModel) {
     throw new Error(t('bg_setup_noNavigatorModel'));
   }
+
+  // Refresh Conigma token cache before creating models (in case user just connected)
+  await initConigmaTokenCache();
+
   // Log the provider config being used for the navigator
   const navigatorProviderConfig = providers[navigatorModel.provider];
   const navigatorLLM = createChatModel(navigatorProviderConfig, navigatorModel);
@@ -359,3 +369,219 @@ async function subscribeToExecutorEvents(executor: Executor) {
     }
   });
 }
+
+// ============================================
+// AI Chat Real-time Updates via SSE
+// ============================================
+
+let sseConnection: { close: () => void } | null = null;
+let sseReconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Connect to SSE endpoint for real-time chat updates
+ */
+async function connectSSE(): Promise<void> {
+  // Close existing connection
+  if (sseConnection) {
+    sseConnection.close();
+    sseConnection = null;
+  }
+
+  // Clear any pending reconnect
+  if (sseReconnectTimeout) {
+    clearTimeout(sseReconnectTimeout);
+    sseReconnectTimeout = null;
+  }
+
+  try {
+    const connection = await conigmaConnectionStore.get();
+    if (!connection?.accessToken || !connection?.serverUrl || !connection?.selectedWorkspaceId) {
+      logger.info('[SSE] Not connected to Conigma');
+      return;
+    }
+
+    const sseUrl = `${connection.serverUrl}/api/extension/events?workspace_id=${connection.selectedWorkspaceId}`;
+    logger.info('[SSE] Connecting to server for chat updates...');
+
+    const controller = new AbortController();
+
+    fetch(sseUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${connection.accessToken}`,
+        Accept: 'text/event-stream',
+      },
+      signal: controller.signal,
+    })
+      .then(async response => {
+        if (!response.ok || !response.body) {
+          throw new Error(`SSE connection failed: ${response.status}`);
+        }
+
+        logger.info('[SSE] ✓ Connected - real-time chat sync active');
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            logger.info('[SSE] Stream ended');
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process complete SSE messages
+          const lines = buffer.split('\n\n');
+          buffer = lines.pop() || ''; // Keep incomplete message
+
+          for (const message of lines) {
+            if (message.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(message.substring(6));
+                await handleSSEEvent(data);
+              } catch (e) {
+                // Ignore parse errors for heartbeats
+              }
+            }
+          }
+        }
+
+        // Stream ended - reconnect
+        handleSSEDisconnect();
+      })
+      .catch(error => {
+        if (error.name !== 'AbortError') {
+          logger.warning('[SSE] Connection error:', error.message);
+          handleSSEDisconnect();
+        }
+      });
+
+    // Store controller for cleanup
+    sseConnection = { close: () => controller.abort() };
+  } catch (error) {
+    logger.error('[SSE] Error connecting:', error);
+    handleSSEDisconnect();
+  }
+}
+
+/**
+ * Handle SSE disconnection - schedule reconnect
+ */
+function handleSSEDisconnect(): void {
+  sseConnection = null;
+
+  // Schedule reconnect attempt in 5 seconds
+  if (!sseReconnectTimeout) {
+    sseReconnectTimeout = setTimeout(() => {
+      sseReconnectTimeout = null;
+      logger.info('[SSE] Attempting to reconnect...');
+      connectSSE();
+    }, 5000);
+  }
+}
+
+/**
+ * Handle SSE event - relay chat updates to SidePanel
+ */
+async function handleSSEEvent(event: any): Promise<void> {
+  try {
+    switch (event.type) {
+      case 'connected':
+        logger.info('[SSE] Successfully subscribed to workspace:', event.workspace_id);
+        break;
+
+      case 'message':
+        // Relay message updates to SidePanel for real-time sync
+        logger.info('[SSE] Message update:', event.event, event.data?.id);
+        try {
+          chrome.runtime
+            .sendMessage({
+              type: 'AI_MESSAGE_UPDATE',
+              event: event.event, // INSERT, UPDATE, DELETE
+              data: event.data,
+            })
+            .catch(() => {
+              // Ignore if no listeners (SidePanel might not be open)
+            });
+        } catch (e) {
+          // Ignore send errors
+        }
+        break;
+
+      case 'conversation':
+        // Relay conversation updates to SidePanel
+        logger.info('[SSE] Conversation update:', event.event, event.data?.id);
+        try {
+          chrome.runtime
+            .sendMessage({
+              type: 'AI_CONVERSATION_UPDATE',
+              event: event.event, // INSERT, UPDATE, DELETE
+              data: event.data,
+            })
+            .catch(() => {
+              // Ignore if no listeners
+            });
+        } catch (e) {
+          // Ignore send errors
+        }
+        break;
+    }
+  } catch (error) {
+    logger.error('[SSE] Error handling event:', error);
+  }
+}
+
+/**
+ * Disconnect SSE
+ */
+function disconnectSSE(): void {
+  if (sseReconnectTimeout) {
+    clearTimeout(sseReconnectTimeout);
+    sseReconnectTimeout = null;
+  }
+
+  if (sseConnection) {
+    sseConnection.close();
+    sseConnection = null;
+  }
+
+  logger.info('[SSE] Disconnected');
+}
+
+/**
+ * Start background services (SSE for real-time chat sync)
+ */
+function startBackgroundServices(): void {
+  connectSSE();
+}
+
+/**
+ * Stop background services
+ */
+function stopBackgroundServices(): void {
+  disconnectSSE();
+}
+
+// Start background services when Conigma connection changes
+conigmaConnectionStore.subscribe(async () => {
+  const isConnected = await conigmaConnectionStore.isConnected();
+  if (isConnected) {
+    logger.info('[Background Services] Conigma connected, starting background services');
+    startBackgroundServices();
+  } else {
+    logger.info('[Background Services] Conigma disconnected, stopping background services');
+    stopBackgroundServices();
+  }
+});
+
+// Check connection status on startup and start services if connected
+(async () => {
+  const isConnected = await conigmaConnectionStore.isConnected();
+  if (isConnected) {
+    logger.info('[Background Services] Already connected to Conigma, starting background services');
+    startBackgroundServices();
+  }
+})();
